@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Copyright 2016  Xiaohui Zhang  Apache 2.0.
 # Copyright 2019  SmartAction (kkm)
 
@@ -147,6 +147,7 @@ do_combine() {
   # Assign all source gzipped archive names to an exported variable, one each
   # per source directory, so that we can copy archives in a job per source.
   src_id=0
+  new_id=0
   for src in $@; do
     src_id=$((src_id + 1))
     nj_src=$(cat $src/num_jobs) || exit 1
@@ -154,23 +155,28 @@ do_combine() {
     # Each numbered variable will contain the list of archives, e. g.:
     # src_arcs_1="exp/tri3_ali/ali.1.gz exp/tri3_ali/ali.1.gz ..."
     # ('printf' repeats its format as long as there are more arguments).
-    printf -v src_arks_${src_id} "$src/$ark.%d.gz " $(seq $nj_src)
-    export src_arks_${src_id}
+    for src_nj_id in $(seq $nj_src); do
+      new_id=$((new_id + 1))
+      printf "$src/$ark.%d.gz" $src_nj_id > $temp_dir/src_arks.${new_id}
+    done
   done
 
   # Gather archives in parallel jobs.
-  $cmd JOB=1:$src_id $dest/log/gather_$entities.JOB.log \
+  $cmd JOB=1:$new_id $dest/log/gather_$entities.JOB.log \
     $copy_program \
-      "ark:gunzip -c \${src_arks_JOB} |" \
+      "ark:gunzip -c \$(cat $temp_dir/src_arks.JOB) |" \
       "ark,scp:$temp_dir/$ark.JOB.ark,$temp_dir/$ark.JOB.scp" || exit 1
 
   # Merge (presumed already sorted) scp's into a single script.
   sort -m $temp_dir/$ark.*.scp > $temp_dir/$ark.scp || exit 1
 
+  inputs=$(for n in `seq $nj`; do echo $temp_dir/$ark.$n.scp; done)
+  utils/split_scp.pl --utt2spk=$data/utt2spk $temp_dir/$ark.scp $inputs
+
   echo "$0: Splitting combined $entities into $nj archives on speaker boundary."
   $cmd JOB=1:$nj $dest/log/chop_combined_$entities.JOB.log \
     $copy_program \
-      "scp:utils/split_scp.pl --utt2spk=$data/utt2spk --one-based -j $nj JOB $temp_dir/$ark.scp |" \
+      "scp:$temp_dir/$ark.JOB.scp" \
       "ark:| gzip -c > $dest/$ark.JOB.gz" || exit 1
 
   # Get some interesting stats, and signal an error if error threshold exceeded.

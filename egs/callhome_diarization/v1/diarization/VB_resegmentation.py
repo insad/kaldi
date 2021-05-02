@@ -8,6 +8,7 @@
 # output the rttm prediction(output_dir), path to diagonal UBM model(dubm_model) and path to 
 # i-vector extractor model(ie_model).
 
+import os
 import numpy as np
 import VB_diarization
 import kaldi_io
@@ -31,6 +32,17 @@ def get_utt2num_frames(utt2num_frames_filename):
         line_split = line.split()
         utt2num_frames[line_split[0]] = int(line_split[1])
     return utt2num_frames
+
+# prepare utt2feats dictionary
+def get_utt2feats(utt2feats_filename):
+    utt2feats = {}
+    with open(utt2feats_filename, 'r') as fh:
+        content = fh.readlines()
+    for line in content:
+        line = line.strip('\n')
+        line_split = line.split(None, 1)
+        utt2feats[line_split[0]] = line_split[1]
+    return utt2feats
 
 def create_ref(uttname, utt2num_frames, full_rttm_filename):
     num_frames = utt2num_frames[uttname]
@@ -134,6 +146,8 @@ def main():
                         help='Channel information in the rttm file')
     parser.add_argument('--initialize', type=int, default=1,
                         help='Whether to initalize the speaker posterior')
+    parser.add_argument('--save-posterior', action='store_true', help='Saves Q-matrix \
+                        (can be used for overlap assignment)')
 
     args = parser.parse_args()
     print(args)
@@ -157,9 +171,7 @@ def main():
     V = IE_M
 
     # Load the MFCC features
-    feats_dict = {}
-    for key,mat in kaldi_io.read_mat_scp("{}/feats.scp".format(args.data_dir)):
-        feats_dict[key] = mat
+    feats_dict = get_utt2feats("{}/feats.scp".format(args.data_dir))
 
     for utt in utt_list:
         # Get the alignments from the clustering result.
@@ -169,7 +181,7 @@ def main():
         init_ref = create_ref(utt, utt2num_frames, args.init_rttm_filename)
 
         # load MFCC features
-        X = (feats_dict[utt]).astype(np.float64)
+        X = kaldi_io.read_mat(feats_dict[utt]).astype(np.float64)
         assert len(init_ref) == len(X)
 
         # Keep only the voiced frames (0 denotes the silence 
@@ -197,15 +209,20 @@ def main():
         #      probabilities of the redundant speaker should converge to zero.
         # Li - values of auxiliary function (and DER and frame cross-entropy between q
         #      and reference if 'ref' is provided) over iterations.
-        q_out, sp_out, L_out = VB_diarization.VB_diarization(X_voiced, m, iE, w, V, sp=None, q=q, maxSpeakers=args.max_speakers, maxIters=args.max_iters, VtiEV=None,
-                                  downsample=args.downsample, alphaQInit=args.alphaQInit, sparsityThr=args.sparsityThr, epsilon=args.epsilon, minDur=args.minDur,
-                                  loopProb=args.loopProb, statScale=args.statScale, llScale=args.llScale, ref=None, plot=False)
+        q_out, sp_out, L_out = VB_diarization.VB_diarization(X_voiced, m, iE, w, V, pi=None, gamma=q, maxSpeakers=args.max_speakers, 
+                                maxIters=args.max_iters, VtinvSigmaV=None, downsample=args.downsample, alphaQInit=args.alphaQInit, 
+                                sparsityThr=args.sparsityThr, epsilon=args.epsilon, minDur=args.minDur, loopProb=args.loopProb, 
+                                statScale=args.statScale, llScale=args.llScale, ref=None, plot=False)
         predicted_label_voiced = np.argmax(q_out, 1) + 2
         predicted_label = (np.zeros(len(mask))).astype(int)
         predicted_label[mask] = predicted_label_voiced
 
         # Create the output rttm file
         create_rttm_output(utt, predicted_label, args.output_dir, args.channel)
+        # Save Q-matrix.
+        if args.save_posterior:
+            with open(os.path.join(args.output_dir, '{}_q_out.npy'.format(utt)), 'wb') as f:
+                np.save(f, q_out)
     return 0
 
 if __name__ == "__main__":
