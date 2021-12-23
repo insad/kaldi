@@ -15,18 +15,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <atomic>
-#if HAVE_CUDA == 1
-
-#define KALDI_CUDA_DECODER_WAIT_FOR_TASKS_US 10000
-#define KALDI_CUDA_DECODER_WAIT_FOR_NEW_TASKS_US 100
-
-#include <nvToolsExt.h>
+#if !HAVE_CUDA
+#error CUDA support is required to compile this library.
+#endif
 
 #include "cudadecoder/batched-threaded-nnet3-cuda-pipeline2.h"
 
+#include <atomic>
+
+#include <nvToolsExt.h>
+
 namespace kaldi {
 namespace cuda_decoder {
+
+const float kSleepForTaskComplete = 10e-3;
+const float kSleepForNewTask = 100e-6;
 
 BatchedThreadedNnet3CudaPipeline2::BatchedThreadedNnet3CudaPipeline2(
     const BatchedThreadedNnet3CudaPipeline2Config &config,
@@ -147,7 +150,7 @@ void BatchedThreadedNnet3CudaPipeline2::BuildBatchFromCurrentTasks() {
 
 void BatchedThreadedNnet3CudaPipeline2::WaitForAllTasks() {
   while (n_tasks_not_done_.load() != 0) {
-    usleep(KALDI_CUDA_DECODER_WAIT_FOR_TASKS_US);
+    Sleep(kSleepForTaskComplete);
   }
 }
 
@@ -180,7 +183,7 @@ void BatchedThreadedNnet3CudaPipeline2::WaitForGroup(const std::string &group) {
   }
 
   while (n_not_done->load(std::memory_order_consume) != 0)
-    usleep(KALDI_CUDA_DECODER_WAIT_FOR_TASKS_US);
+    Sleep(kSleepForTaskComplete);
 }
 
 void BatchedThreadedNnet3CudaPipeline2::CreateTask(
@@ -290,7 +293,8 @@ void BatchedThreadedNnet3CudaPipeline2::SegmentedDecodeWithCallback(
     } else {
       std::unique_ptr<SubVector<BaseFloat>> h_wave_segment(
           new SubVector<BaseFloat>(h_wave.Data() + offset, nsamples));
-      BaseFloat offset_seconds = offset / model_freq_;
+      BaseFloat offset_seconds =
+          std::floor(static_cast<BaseFloat>(offset) / model_freq_);
 
       // Saving this segment offset in result for later use
       (*segmented_results)[isegment].SetTimeOffsetSeconds(offset_seconds);
@@ -301,30 +305,14 @@ void BatchedThreadedNnet3CudaPipeline2::SegmentedDecodeWithCallback(
       // call the segmented callback with the vector of results
       LatticeCallback callback = [=](CompactLattice &clat) {
         CudaPipelineResult &result = (*segmented_results)[isegment];
-        if (result_type & CudaPipelineResult::RESULT_TYPE_LATTICE) {
-          if (lattice_postprocessor_) {
-            CompactLattice postprocessed_clat;
-            bool ok = lattice_postprocessor_->GetPostprocessedLattice(
-                clat, &postprocessed_clat);
-            if (ok) result.SetLatticeResult(std::move(postprocessed_clat));
-          } else {
-            result.SetLatticeResult(std::move(clat));
-          }
-        }
 
-        if (result_type & CudaPipelineResult::RESULT_TYPE_CTM) {
-          CTMResult ctm_result;
-          KALDI_ASSERT(lattice_postprocessor_ &&
-                       "A lattice postprocessor must be set with "
-                       "SetLatticePostprocessor() to use RESULT_TYPE_CTM");
-          bool ok = lattice_postprocessor_->GetCTM(clat, &ctm_result);
-          if (ok) result.SetCTMResult(std::move(ctm_result));
-        }
+        SetResultUsingLattice(clat, result_type, lattice_postprocessor_,
+                              &result);
 
         int n_not_done = n_segments_callbacks_not_done_->fetch_sub(1);
         if (n_not_done == 1 && segmented_callback) {
           SegmentedLatticeCallbackParams params;
-          params.results = *segmented_results;
+          params.results = std::move(*segmented_results);
           segmented_callback(params);
         }
       };
@@ -446,7 +434,7 @@ void BatchedThreadedNnet3CudaPipeline2::ComputeTasks() {
     if (current_tasks_.size() < max_batch_size_) AcquireTasks();
     if (current_tasks_.empty()) {
       // If we still have nothing to do, let's sleep a bit
-      usleep(KALDI_CUDA_DECODER_WAIT_FOR_NEW_TASKS_US);
+      Sleep(kSleepForNewTask);
       continue;
     }
     BuildBatchFromCurrentTasks();
@@ -470,11 +458,9 @@ void BatchedThreadedNnet3CudaPipeline2::SetLatticePostprocessor(
   lattice_postprocessor_ = lattice_postprocessor;
   lattice_postprocessor_->SetDecoderFrameShift(
       cuda_online_pipeline_.GetDecoderFrameShiftSeconds());
-  lattice_postprocessor_->SetTransitionModel(
+  lattice_postprocessor_->SetTransitionInformation(
       &cuda_online_pipeline_.GetTransitionModel());
 }
 
 }  // namespace cuda_decoder
-}  // end namespace kaldi.
-
-#endif  // HAVE_CUDA
+}  // namespace kaldi
